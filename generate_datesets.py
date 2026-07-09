@@ -1,10 +1,15 @@
 import json
 import argparse
+import os
+import pickle
+import platform
+import multiprocessing
 import numpy as np
 from transformers import PreTrainedTokenizerFast
 from concurrent.futures import ProcessPoolExecutor
 
-MODEL_PATH = "/nvme1n1/DeepSeek-V4-Pro-w4a8-mtp"
+# MODEL_PATH = "/nvme1n1/DeepSeek-V4-Pro-w4a8-mtp"
+MODEL_PATH = "/nvme1n1/models/LLM/GLM-5.1-w8a8"
 NUM_REQUESTS = 50
 PRIVATE_PREFIX_TOKENS = 3584
 PRIVATE_SUFFIX_TOKENS = 3584
@@ -20,23 +25,24 @@ def parse_args():
     parser.add_argument('--output-common', type=str, default='common.jsonl', help='公共前缀数据集文件名')
     parser.add_argument('--output-prefill', type=str, default='prefill.jsonl', help='预埋数据集文件名')
     parser.add_argument('--output-full', type=str, default='full.jsonl', help='完整数据集文件名')
-    parser.add_argument('--workers', type=int, default=10, help='并行worker数，大数据集建议4-8（默认: 1）')
+    parser.add_argument('--workers', type=int, default=256, help='并行worker数（默认: 20）')
     return parser.parse_args()
 
 _global_tokenizer = None
-_global_safe_ids = None
+_global_sample_pool = None
 
-def _init_worker(model_path, safe_ids_list):
-    global _global_tokenizer, _global_safe_ids
-    _global_tokenizer = PreTrainedTokenizerFast.from_pretrained(model_path)
-    _global_safe_ids = np.array(safe_ids_list)
+def _init_worker(model_path, sample_pool_list):
+    global _global_tokenizer, _global_sample_pool
+    if _global_tokenizer is None:
+        _global_tokenizer = PreTrainedTokenizerFast.from_pretrained(model_path)
+    if _global_sample_pool is None:
+        _global_sample_pool = np.array(sample_pool_list)
 
-def gen_exact_tokens(target_tokens, tokenizer, safe_ids, rng):
+def gen_exact_tokens(target_tokens, tokenizer, sample_pool, rng):
     if target_tokens == 0:
         return ""
-    buffer = max(50, int(target_tokens * 0.15))
-    token_ids = rng.choice(safe_ids, target_tokens + buffer).tolist()
-    text = tokenizer.decode(token_ids, skip_special_tokens=True)
+    sampled_ids = rng.choice(sample_pool, target_tokens).tolist()
+    text = tokenizer.decode(sampled_ids, skip_special_tokens=True)
     actual_ids = tokenizer.encode(text, add_special_tokens=False)
 
     for _ in range(10):
@@ -44,15 +50,17 @@ def gen_exact_tokens(target_tokens, tokenizer, safe_ids, rng):
         if actual_count == target_tokens:
             return text
         if actual_count > target_tokens:
-            actual_ids = actual_ids[:target_tokens]
-            text = tokenizer.decode(actual_ids, skip_special_tokens=True)
+            excess = actual_count - target_tokens
+            remove_est = max(1, int(excess * len(sampled_ids) / actual_count))
+            sampled_ids = sampled_ids[:len(sampled_ids) - remove_est]
+            text = tokenizer.decode(sampled_ids, skip_special_tokens=True)
             actual_ids = tokenizer.encode(text, add_special_tokens=False)
         else:
             need = target_tokens - actual_count
-            extra = need + max(50, int(need * 0.15))
-            more_ids = rng.choice(safe_ids, extra).tolist()
-            actual_ids = actual_ids + more_ids
-            text = tokenizer.decode(actual_ids, skip_special_tokens=True)
+            extra = need + max(20, int(need * 0.1))
+            more_ids = rng.choice(sample_pool, extra).tolist()
+            sampled_ids = sampled_ids + more_ids
+            text = tokenizer.decode(sampled_ids, skip_special_tokens=True)
             actual_ids = tokenizer.encode(text, add_special_tokens=False)
 
     return text
@@ -61,10 +69,10 @@ def _generate_request(args):
     idx, common_prefix, prefix_tokens, suffix_tokens, seed = args
     rng = np.random.default_rng(seed + idx + 1)
     tokenizer = _global_tokenizer
-    safe_ids = _global_safe_ids
+    sample_pool = _global_sample_pool
 
-    private_prefix = gen_exact_tokens(prefix_tokens, tokenizer, safe_ids, rng)
-    private_suffix = gen_exact_tokens(suffix_tokens, tokenizer, safe_ids, rng)
+    private_prefix = gen_exact_tokens(prefix_tokens, tokenizer, sample_pool, rng)
+    private_suffix = gen_exact_tokens(suffix_tokens, tokenizer, sample_pool, rng)
 
     common_entry = {"question": common_prefix, "answer": "test"}
     prefill_question = (common_prefix + " " + private_prefix) if common_prefix else private_prefix
@@ -76,8 +84,7 @@ def _generate_request(args):
 
 def save_jsonl(data: list, filename: str):
     with open(filename, "w", encoding="utf-8") as f:
-        for item in data:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        f.write("\n".join(json.dumps(item, ensure_ascii=False) for item in data) + "\n")
 
 def main():
     args = parse_args()
@@ -100,28 +107,72 @@ def main():
 
     np.random.seed(SEED)
     tokenizer = PreTrainedTokenizerFast.from_pretrained(MODEL_PATH)
-    vocab_size = tokenizer.vocab_size
-    special_ids = set(tokenizer.all_special_ids)
-    valid_ids = [i for i in range(vocab_size) if i not in special_ids]
 
-    print("筛选roundtrip安全token...")
-    safe_ids = []
-    for tid in valid_ids:
-        decoded = tokenizer.decode([tid], skip_special_tokens=True)
-        if decoded and len(tokenizer.encode(decoded, add_special_tokens=False)) == 1:
-            safe_ids.append(tid)
-    print(f"  安全token: {len(safe_ids)} / {len(valid_ids)}")
+    cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "safe_ids_cache.pkl")
+    safe_ids = None
+    word_start_ids = None
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "rb") as f:
+                cache = pickle.load(f)
+            if cache.get("model_path") == MODEL_PATH and cache.get("vocab_size") == tokenizer.vocab_size:
+                safe_ids = cache["safe_ids"]
+                word_start_ids = cache.get("word_start_ids")
+                print(f"从缓存加载安全token: {len(safe_ids)} 个 (跳过筛选)")
+                if word_start_ids:
+                    print(f"  词首token: {len(word_start_ids)} 个")
+                else:
+                    print("  缓存缺少词首token，从safe_ids补算...")
+                    token_strs = tokenizer.convert_ids_to_tokens(safe_ids)
+                    word_start_ids = [tid for tid, ts in zip(safe_ids, token_strs) if ts and (ts.startswith('Ġ') or ts.startswith('▁'))]
+                    print(f"  词首token: {len(word_start_ids)} 个")
+                    if len(word_start_ids) < 100:
+                        print("警告: 词首token太少，回退到safe_ids")
+                        word_start_ids = safe_ids
+                    with open(cache_path, "wb") as f:
+                        pickle.dump({"model_path": MODEL_PATH, "vocab_size": tokenizer.vocab_size, "safe_ids": safe_ids, "word_start_ids": word_start_ids}, f)
+        except Exception:
+            safe_ids = None
+            word_start_ids = None
 
-    if len(safe_ids) == 0:
-        print("警告: 无可用安全token，回退到valid_ids")
-        safe_ids = valid_ids
+    if safe_ids is None:
+        vocab_size = tokenizer.vocab_size
+        special_ids = set(tokenizer.all_special_ids)
+        valid_ids = [i for i in range(vocab_size) if i not in special_ids]
 
-    safe_ids_np = np.array(safe_ids)
+        print("筛选roundtrip安全token（批量模式）...")
+        decoded_batch = tokenizer.batch_decode([[tid] for tid in valid_ids], skip_special_tokens=True)
+        non_empty_pairs = [(tid, s) for tid, s in zip(valid_ids, decoded_batch) if s]
+        strings_to_check = [s for _, s in non_empty_pairs]
+        encodings = tokenizer.backend_tokenizer.encode_batch(strings_to_check, add_special_tokens=False)
+        safe_ids = [tid for (tid, _), enc in zip(non_empty_pairs, encodings) if len(enc.ids) == 1]
+        print(f"  安全token: {len(safe_ids)} / {len(valid_ids)}")
+
+        if len(safe_ids) == 0:
+            print("警告: 无可用安全token，回退到valid_ids")
+            safe_ids = valid_ids
+
+        print("筛选词首token（Ġ/▁开头，边界不合并）...")
+        token_strs = tokenizer.convert_ids_to_tokens(safe_ids)
+        word_start_ids = [tid for tid, ts in zip(safe_ids, token_strs) if ts and (ts.startswith('Ġ') or ts.startswith('▁'))]
+        print(f"  词首token: {len(word_start_ids)} / {len(safe_ids)}")
+
+        if len(word_start_ids) < 100:
+            print("警告: 词首token太少，回退到safe_ids")
+            word_start_ids = safe_ids
+
+        with open(cache_path, "wb") as f:
+            pickle.dump({"model_path": MODEL_PATH, "vocab_size": vocab_size, "safe_ids": safe_ids, "word_start_ids": word_start_ids}, f)
+        print(f"  已缓存到 {cache_path}")
+
+    sample_pool = word_start_ids if word_start_ids else safe_ids
+    sample_pool_np = np.array(sample_pool)
+    print(f"采样池: {len(sample_pool)} 个token (词首={len(word_start_ids) if word_start_ids else 0}, 全部safe={len(safe_ids)})")
     rng = np.random.default_rng(SEED)
 
     common_prefix = ""
     if COMMON_PREFIX_TOKENS > 0:
-        common_prefix = gen_exact_tokens(COMMON_PREFIX_TOKENS, tokenizer, safe_ids_np, rng)
+        common_prefix = gen_exact_tokens(COMMON_PREFIX_TOKENS, tokenizer, sample_pool_np, rng)
         print(f"已生成公共前缀: {COMMON_PREFIX_TOKENS} tokens")
 
     common_data = []
@@ -131,8 +182,8 @@ def main():
     if args.workers <= 1:
         for i in range(NUM_REQUESTS):
             request_rng = np.random.default_rng(SEED + i + 1)
-            private_prefix = gen_exact_tokens(PRIVATE_PREFIX_TOKENS, tokenizer, safe_ids_np, request_rng)
-            private_suffix = gen_exact_tokens(PRIVATE_SUFFIX_TOKENS, tokenizer, safe_ids_np, request_rng)
+            private_prefix = gen_exact_tokens(PRIVATE_PREFIX_TOKENS, tokenizer, sample_pool_np, request_rng)
+            private_suffix = gen_exact_tokens(PRIVATE_SUFFIX_TOKENS, tokenizer, sample_pool_np, request_rng)
 
             common_data.append({"question": common_prefix, "answer": "test"})
             prefill_question = (common_prefix + " " + private_prefix) if common_prefix else private_prefix
@@ -140,14 +191,14 @@ def main():
             full_question = (prefill_question + " " + private_suffix) if prefill_question else private_suffix
             full_data.append({"question": full_question, "answer": "test"})
 
-            common_len = len(tokenizer.encode(common_prefix, add_special_tokens=False)) if common_prefix else 0
-            prefill_len = len(tokenizer.encode(prefill_question, add_special_tokens=False))
-            full_len = len(tokenizer.encode(full_question, add_special_tokens=False))
-            print(f"prompt [{i+1}]: common={common_len} prefill={prefill_len} full={full_len}")
-
+            prefix_len = len(tokenizer.encode(private_prefix, add_special_tokens=False))
+            suffix_len = len(tokenizer.encode(private_suffix, add_special_tokens=False))
+            full_len = len(tokenizer.encode(prefill_question + " " + private_suffix if prefill_question else private_suffix, add_special_tokens=False))
+            print(f"  [{i+1}] prefix={prefix_len} suffix={suffix_len} full={full_len}")
 
     else:
-        with ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker, initargs=(MODEL_PATH, safe_ids)) as pool:
+        mp_ctx = multiprocessing.get_context('fork') if platform.system() == 'Linux' else None
+        with ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker, initargs=(MODEL_PATH, sample_pool), mp_context=mp_ctx) as pool:
             task_args = [(i, common_prefix, PRIVATE_PREFIX_TOKENS, PRIVATE_SUFFIX_TOKENS, SEED) for i in range(NUM_REQUESTS)]
             results = list(pool.map(_generate_request, task_args))
 
@@ -167,3 +218,16 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# python generate_datasets.py --num-requests 2000 --common-prefix 0 --private-prefix 4096 --private-suffix 4096 --seed 140000
+# sed -i 's/max_out_len=[0-9]\+/max_out_len=1/' ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_stream.py
+# sed -i 's/request_rate=[0-9.]\+/request_rate=0/' ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_stream.py
+# sed -i 's/batch_size=[0-9]\+/batch_size=256/' ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_stream.py
+# # echo "存储预埋"
+# # ais_bench --models vllm_api_general_stream --custom-dataset-path prefill.jsonl --mode perf  --num-warmups 0
+# python hit_rate.py --action before --pods "10.141.19.144:8001" "10.141.19.144:8002" "10.141.19.145:8001" "10.141.19.145:8002"
+# echo "正式测试"
+# sed -i 's/max_out_len=[0-9]\+/max_out_len=512/' ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_stream.py
+# ais_bench --models vllm_api_general_stream --custom-dataset-path full.jsonl --mode perf --num-warmups 0
+# python hit_rate.py --action after --pods "10.141.19.144:8001" "10.141.19.144:8002" "10.141.19.145:8001" "10.141.19.145:8002"
