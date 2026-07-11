@@ -225,9 +225,9 @@ if __name__ == "__main__":
 # sed -i 's/request_rate=[0-9.]\+/request_rate=0/' ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_stream.py
 # sed -i 's/batch_size=[0-9]\+/batch_size=256/' ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_stream.py
 # # echo "存储预埋"
-# # ais_bench --models vllm_api_general_stream --custom-dataset-path prefill.jsonl --mode perf  --num-warmups 0
+# # ais_bench --models vllm_api_general_stream --custom-dataset-path prefill.jsonl --mode perf  --num-warmups 0  --num-prompts 10
 # python hit_rate.py --action before --pods "10.141.19.144:8001" "10.141.19.144:8002" "10.141.19.145:8001" "10.141.19.145:8002"
 # echo "正式测试"
 # sed -i 's/max_out_len=[0-9]\+/max_out_len=512/' ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_stream.py
-# ais_bench --models vllm_api_general_stream --custom-dataset-path full.jsonl --mode perf --num-warmups 0
+# ais_bench --models vllm_api_general_stream --custom-dataset-path full.jsonl --mode perf --num-warmups 0  --num-prompts 10
 # python hit_rate.py --action after --pods "10.141.19.144:8001" "10.141.19.144:8002" "10.141.19.145:8001" "10.141.19.145:8002"
