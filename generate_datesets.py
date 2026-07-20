@@ -219,15 +219,20 @@ def main():
 if __name__ == "__main__":
     main()
 
-
-# python generate_datasets.py --num-requests 2000 --common-prefix 0 --private-prefix 4096 --private-suffix 4096 --seed 140000
+# 修改aisben配置文件
+# sed -i 's/path="[^"]*"/path="\/models\/Qwen3.5-27B"/' ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_stream.py
+# sed -i 's/model="[^"]*"/model="Qwen3"/' ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_stream.py
+# sed -i 's/host_ip="[^"]*"/host_ip="127.0.0.1"/' ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_stream.py
+# sed -i 's/host_port=[0-9]*/host_port=8000/' ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_stream.py
 # sed -i 's/max_out_len=[0-9]\+/max_out_len=1/' ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_stream.py
 # sed -i 's/request_rate=[0-9.]\+/request_rate=0/' ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_stream.py
 # sed -i 's/batch_size=[0-9]\+/batch_size=256/' ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_stream.py
+# 生成数据集
+# python generate_datasets.py --num-requests 2000 --common-prefix 0 --private-prefix 4096 --private-suffix 4096 --seed 140000
 # # echo "存储预埋"
 # # ais_bench --models vllm_api_general_stream --custom-dataset-path prefill.jsonl --mode perf  --num-warmups 0  --num-prompts 10
-# python hit_rate.py --action before --pods "10.141.19.144:8001" "10.141.19.144:8002" "10.141.19.145:8001" "10.141.19.145:8002"
 # echo "正式测试"
 # sed -i 's/max_out_len=[0-9]\+/max_out_len=512/' ais_bench/benchmark/configs/models/vllm_api/vllm_api_general_stream.py
+# python hit_rate.py --action before --pods "10.141.19.144:8001" "10.141.19.144:8002" "10.141.19.145:8001" "10.141.19.145:8002"
 # ais_bench --models vllm_api_general_stream --custom-dataset-path full.jsonl --mode perf --num-warmups 0  --num-prompts 10
 # python hit_rate.py --action after --pods "10.141.19.144:8001" "10.141.19.144:8002" "10.141.19.145:8001" "10.141.19.145:8002"
